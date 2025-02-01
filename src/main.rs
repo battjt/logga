@@ -5,12 +5,13 @@ use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
 use std::{
     fs::{self, File},
-    io::{self, stdout, BufRead, Read, Write},
+    io::{self, stdout, BufRead, Read, Seek, Write},
     path::Path,
     sync::{atomic::AtomicU64, Arc, Mutex},
     thread,
     time::Duration,
 };
+use zip::{read::ZipFile, ZipArchive};
 
 fn main() -> Result<()> {
     ZipDirAnalyzer::run(Args::parse())
@@ -78,9 +79,7 @@ impl ZipDirAnalyzer {
     pub fn run(args: Args) -> Result<()> {
         let binding = args.directory.clone();
         let zip_dir_analyzer = ZipDirAnalyzer {
-            pool: Arc::new(Mutex::new(ThreadPoolExecutor::new(
-                args.parallel,
-            ))),
+            pool: Arc::new(Mutex::new(ThreadPoolExecutor::new(args.parallel))),
             ops_scheduled: Default::default(),
             ops_complete: Default::default(),
             regex: regex::Regex::new(&args.line_pat)?,
@@ -160,18 +159,24 @@ impl ZipDirAnalyzer {
     }
 
     /// path is a zip, so unzip and process each entry
-    fn walk_zip(&self, path: &str, zip_file: &mut File) -> Result<()> {
+    fn walk_zip(&self, path: &str, zip_file: &mut dyn ReadSeek) -> Result<()> {
         let mut archive = zip::ZipArchive::new(zip_file)?;
         for i in 0..archive.len() {
-            let  zip_file = archive.by_index(i)?;
-            if zip_file.is_dir() {
+            let (is_dir, file_name) = {
+                let zip_file: zip::read::ZipFile = archive.by_index(i)?;
+                (
+                    zip_file.is_dir(),
+                    path.to_string() + "!" + &zip_file.name().to_string(),
+                )
+            };
+            if is_dir {
                 // just a directory placeholder.
             } else {
-                let file_name = path.to_string() + "!" + &zip_file.name().to_string();
                 if file_name.ends_with(".zip") {
-                    eprintln!("No support for a zip of a zip yet {file_name}");
+                    let archive = &mut archive;
+                    self.walk_zip(&file_name, &mut ZipFileSeeker::new(archive, i))?;
                 } else {
-                    self.grep_file(&file_name, zip_file)?;
+                    self.grep_file(&file_name, archive.by_index(i)?)?;
                 }
             }
         }
@@ -232,5 +237,42 @@ impl ZipDirAnalyzer {
             stdout().write_fmt(format_args!("{}{}{}\n", file, self.args.delimiter, line))?;
         }
         Ok(())
+    }
+}
+
+trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek> ReadSeek for T {}
+
+struct ZipFileSeeker<'b, 'a: 'b, R> {
+    zip_archive: &'a mut ZipArchive<R>,
+    index: usize,
+    file: ZipFile<'b>,
+    offset: usize,
+}
+impl<'b, 'a: 'b, R: ReadSeek> ZipFileSeeker<'b, 'a, R> {
+    fn new(zip_archive: &'a mut ZipArchive<R>, index: usize) -> Self {
+        let file = zip_archive.by_index(index).unwrap();
+        ZipFileSeeker {
+            zip_archive,
+            index,
+            file,
+            offset: 0,
+        }
+    }
+}
+impl<'b, 'a: 'b, R> Seek for ZipFileSeeker<'b, 'a, R> {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        match pos {
+            io::SeekFrom::Start(_) => todo!(),
+            io::SeekFrom::End(_) => todo!(),
+            io::SeekFrom::Current(_) => todo!(),
+        }
+    }
+}
+impl<'b, 'a: 'b, R: ReadSeek> Read for ZipFileSeeker<'b, 'a, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let len = self.file.read(buf)?;
+        self.offset += len;
+        Ok(len)
     }
 }
